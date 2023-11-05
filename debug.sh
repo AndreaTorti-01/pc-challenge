@@ -1,1 +1,1 @@
-nvcc main.cu -o main -g -G -w
+nvcc main.cu -o main -g -G -w -arch=sm_75

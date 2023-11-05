@@ -9,6 +9,7 @@
             "type": "cuda-gdb",
             "request": "launch",
             "program": "${workspaceFolder}/main",
+            "args": "erdos_graph.txt",
             "cwd": "${workspaceFolder}"
         },
         {

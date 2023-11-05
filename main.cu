@@ -1,9 +1,8 @@
-#include <chrono>
 #include <cstdio>
-#include <iostream>
+#include <set>
 
 #define BLOCK_SIZE 512
-#define NUM_BLOCKS 45
+#define NUM_BLOCKS 128
 // Maximum number of elements that can be inserted into a block queue
 #define BQ_CAPACITY 2048
 
@@ -17,7 +16,30 @@ typedef struct {
                       // explained
 } Graph;
 
-Graph *loadGraphUndirected(const char *filename) {
+struct TwoInts {
+  int src;
+  int dest;
+
+  // Define operator< for sorting
+  bool operator<(const TwoInts &other) const {
+    if (src != other.src) {
+      return src < other.src;
+    }
+    return dest < other.dest;
+  }
+};
+
+/**
+ * @brief Loads a graph from a file and interprets it as an undirected graph.
+ * first line is the number of nodes and the number of edges, then each line is
+ * an edge.
+ *
+ * @param filename The name of the file to load the graph from.
+ * @param mtx If true, the file is interpreted as a Matrix Market file (1-based
+ * indices).
+ * @return Graph* A GPU pointer to the graph structure.
+ */
+Graph *loadGraphUndirected(const char *filename, bool mtx) {
   FILE *file = fopen(filename, "r");
   if (file == NULL) {
     perror("Error opening file");
@@ -26,35 +48,34 @@ Graph *loadGraphUndirected(const char *filename) {
 
   int numNodes = 0;
   fscanf(file, "%d", &numNodes);
-  bool **matrix_graph = (bool **)calloc(numNodes, sizeof(bool *));
-
-  // start by filling the matrix with zeros
-  for (int i = 0; i < numNodes; i++) {
-    matrix_graph[i] = (bool *)calloc(numNodes, sizeof(bool));
-  }
-
   // scan total number of edges reading it from the file and dump it
   int numEdges;
   fscanf(file, "%d", &numEdges);
 
-  // read the file and fill the matrix
-  int sourceNode = 0;
-  int destNode = 0;
-  while (fscanf(file, "%d", &sourceNode) != EOF) {
-    fscanf(file, "%d", &destNode);
-    matrix_graph[sourceNode][destNode] = true;
-    matrix_graph[destNode][sourceNode] = true;
-  }
+  std::set<TwoInts> mySet;
 
-  // now we can count the number of edges
-  numEdges = 0;
-  for (int i = 0; i < numNodes; i++) {
-    for (int j = 0; j < numNodes; j++) {
-      if (matrix_graph[i][j]) {
-        numEdges++;
-      }
+  // read the file line by line and fill mySet
+  int src, dest;
+  if (!mtx) {
+    while (fscanf(file, "%d %d", &src, &dest) != EOF) {
+      mySet.insert({src, dest});
+    }
+  } else {
+    while (fscanf(file, "%d %d", &src, &dest) != EOF) {
+      mySet.insert({src - 1, dest - 1});
     }
   }
+
+  // for every node {a, b}, check if {b, a} is in the set, if not, add it
+  for (auto it = mySet.begin(); it != mySet.end(); it++) {
+    TwoInts tmp = {it->dest, it->src};
+    if (mySet.find(tmp) == mySet.end()) {
+      mySet.insert(tmp);
+    }
+  }
+
+  // count the edges
+  numEdges = mySet.size();
 
   // allocate memory for the graph with cudaMallocManaged
   Graph *graph;
@@ -67,22 +88,29 @@ Graph *loadGraphUndirected(const char *filename) {
   cudaMalloc(&graph->nodePtrs, sizeof(int) * (graph->numNodes + 1));
   cudaMalloc(&graph->nodeNeighbors, sizeof(int) * numEdges);
 
-  // allocate memory for nodePtrsHost and nodeNeighborsHost with malloc
-  int *nodePtrsHost = (int *)malloc(sizeof(int) * (graph->numNodes + 1));
-  int *nodeNeighborsHost = (int *)malloc(sizeof(int) * numEdges);
+  // allocate memory for nodePtrsHost and nodeNeighborsHost with cudaMallocHost
+  int *nodePtrsHost, *nodeNeighborsHost;
+  cudaMallocHost(&nodePtrsHost, sizeof(int) * (graph->numNodes + 1));
+  cudaMallocHost(&nodeNeighborsHost, sizeof(int) * numEdges);
 
   // fill nodePtrs and nodeNeighbors arrays
-  int edgeIdx = 0;
+  int currNode = 0;
+  int currEdge = 0;
   nodePtrsHost[0] = 0;
-  for (int i = 0; i < numNodes; i++) {
-    for (int j = 0; j < numNodes; j++) {
-      if (matrix_graph[i][j]) {
-        nodeNeighborsHost[edgeIdx] = j;
-        edgeIdx++;
-      }
+  for (auto it = mySet.begin(); it != mySet.end(); it++) {
+    if (it->src == currNode) {
+      nodeNeighborsHost[currEdge] = it->dest;
+      currEdge++;
+    } else {
+      currNode++;
+      nodePtrsHost[currNode] = currEdge;
+      nodeNeighborsHost[currEdge] = it->dest;
+      currEdge++;
     }
-    nodePtrsHost[i + 1] = edgeIdx;
   }
+
+  // free mySet
+  mySet.clear();
 
   // copy nodePtrs and nodeNeighbors arrays to device
   cudaMemcpy(graph->nodePtrs, nodePtrsHost, sizeof(int) * (graph->numNodes + 1),
@@ -90,19 +118,12 @@ Graph *loadGraphUndirected(const char *filename) {
   cudaMemcpy(graph->nodeNeighbors, nodeNeighborsHost, sizeof(int) * numEdges,
              cudaMemcpyHostToDevice);
 
-  // free memory
-  for (int i = 0; i < numNodes; i++) {
-    free(matrix_graph[i]);
-  }
-
-  free(matrix_graph);
-
   fclose(file);
 
   return graph;
 }
 
-// Global queuing stub
+// Global queuing kernel
 __global__ void gpu_global_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
                                           int *nodeVisited, int *currLevelNodes,
                                           int *nextLevelNodes,
@@ -117,13 +138,13 @@ __global__ void gpu_global_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
   for (int i = idx; i < numCurrLevelNodes; i += stride) {
     // Get the node at the current index.
     int node = currLevelNodes[i];
-    for (int j = nodePtrs[node]; j < nodePtrs[node + 1]; j++) {
+    int firstNeighbor = nodePtrs[node];
+    int lastNeighbor = nodePtrs[node + 1];
+    for (int j = firstNeighbor; j < lastNeighbor; j++) {
       // Get the neighbor at the current index.
       int neighbor = nodeNeighbors[j];
       // If the neighbor has not been visited yet.
-      if (nodeVisited[neighbor] == 0) {
-        // Mark the neighbor as visited.
-        nodeVisited[neighbor] = 1;
+      if (atomicCAS(&nodeVisited[neighbor], 0, 1) == 0) {
         // Add the neighbor to the list of nodes to visit in the next level.
         // The atomicAdd function ensures that this operation is thread-safe.
         nextLevelNodes[atomicAdd(numNextLevelNodes, 1)] = neighbor;
@@ -132,38 +153,107 @@ __global__ void gpu_global_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
   }
 }
 
-int main() {
-  const char *filename = "standard2.txt";
+// Block queuing kernel
+__global__ void gpu_block_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
+                                         int *nodeVisited, int *currLevelNodes,
+                                         int *nextLevelNodes,
+                                         const int numCurrLevelNodes,
+                                         int *numNextLevelNodes) {
 
-  Graph *graph = loadGraphUndirected(filename);
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  int stride = blockDim.x * gridDim.x;
+  extern __shared__ int shared_mem[]; // shared_queue[0] is the size of the
+  // queue, the rest is the queue itself
 
-  // initialize nodeVisited, currLevelNodes, nextLevelNodes, numCurrLevelNodes,
-  // numNextLevelNodes
+  int *shared_queue_size = &shared_mem[0];
+  int *shared_queue = &shared_mem[1];
+
+  if (threadIdx.x == 0) {
+    shared_queue_size[0] = 0;
+  }
+  __syncthreads();
+
+  // Iterate over the nodes in the current level. The loop stride is the total
+  // number of threads.
+  for (int i = idx; i < numCurrLevelNodes; i += stride) {
+    // Get the node at the current index.
+    int node = currLevelNodes[i];
+    int firstNeighbor = nodePtrs[node];
+    int lastNeighbor = nodePtrs[node + 1];
+    for (int j = firstNeighbor; j < lastNeighbor; j++) {
+      // Get the neighbor at the current index.
+      int neighbor = nodeNeighbors[j];
+      // If the neighbor has not been visited yet.
+      if (atomicCAS(&nodeVisited[neighbor], 0, 1) == 0) {
+        // if there is space in the shared queue
+        int index = atomicAdd_block(shared_queue_size, 1);
+        if (index < BQ_CAPACITY) {
+          // add the neighbor to the shared queue
+          shared_queue[index] = neighbor;
+        } else {
+          // if there is no space in the shared queue, add the neighbor to the
+          // global queue
+          nextLevelNodes[atomicAdd(numNextLevelNodes, 1)] = neighbor;
+        }
+      }
+    }
+  }
+
+  // copy the shared queue to the global queue
+  __syncthreads();
+
+  if (*shared_queue_size > BQ_CAPACITY)
+    *shared_queue_size = BQ_CAPACITY;
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < *shared_queue_size; i++) {
+      nextLevelNodes[atomicAdd(numNextLevelNodes, 1)] = shared_queue[i];
+    }
+  }
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    printf("Usage: %s <graph file>\n", argv[0]);
+    return 1;
+  }
+
+  const char *filename = argv[1];
+
+  bool mtx = false;
+  // if filename ends with .mtx, then it's a Matrix Market file
+  if (strlen(filename) > 4 &&
+      strcmp(filename + strlen(filename) - 4, ".mtx") == 0) {
+    mtx = true;
+  }
+
+  Graph *graph = loadGraphUndirected(filename, mtx);
+
+  // initialize nodeVisited, currLevelNodes, nextLevelNodes,
+  // numCurrLevelNodes, numNextLevelNodes
   int *nodeVisited;
   int *currLevelNodes;
   int *nextLevelNodes;
   int numCurrLevelNodes;
   int *numNextLevelNodes;
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
 
   cudaMalloc(&nodeVisited, sizeof(int) * graph->numNodes);
   cudaMalloc(&currLevelNodes, sizeof(int) * graph->numNodes);
   cudaMalloc(&nextLevelNodes, sizeof(int) * graph->numNodes);
   cudaMalloc(&numNextLevelNodes, sizeof(int));
 
+  // reset
   cudaMemset(nodeVisited, 0, sizeof(int) * graph->numNodes);
   cudaMemset(currLevelNodes, 0, sizeof(int) * graph->numNodes);
   cudaMemset(nextLevelNodes, 0, sizeof(int) * graph->numNodes);
   numCurrLevelNodes = 1;
   cudaMemset(numNextLevelNodes, 0, sizeof(int));
-
-  // set the source node
   cudaMemset(currLevelNodes, 0, sizeof(int));
   int visited = 1;
   cudaMemcpy(nodeVisited, &visited, sizeof(int), cudaMemcpyHostToDevice);
-
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
   float kernel_total_time_ms = 0.0f;
 
   // main loop
@@ -194,7 +284,8 @@ int main() {
   }
 
   // print number of visited nodes
-  int *nodeVisitedHost = (int *)malloc(sizeof(int) * graph->numNodes);
+  int *nodeVisitedHost;
+  cudaMallocHost(&nodeVisitedHost, sizeof(int) * graph->numNodes);
   cudaMemcpy(nodeVisitedHost, nodeVisited, sizeof(int) * graph->numNodes,
              cudaMemcpyDeviceToHost);
   int numVisitedNodes = 0;
@@ -206,7 +297,61 @@ int main() {
   printf("Number of visited nodes: %d\n", numVisitedNodes);
 
   // print kernel total time
-  printf("Kernel total time: %f ms\n", kernel_total_time_ms);
+  printf("Global queuing kernel total time: %f ms\n", kernel_total_time_ms);
+
+  // reset
+  cudaMemset(nodeVisited, 0, sizeof(int) * graph->numNodes);
+  cudaMemset(currLevelNodes, 0, sizeof(int) * graph->numNodes);
+  cudaMemset(nextLevelNodes, 0, sizeof(int) * graph->numNodes);
+  numCurrLevelNodes = 1;
+  cudaMemset(numNextLevelNodes, 0, sizeof(int));
+  cudaMemset(currLevelNodes, 0, sizeof(int));
+  visited = 1;
+  cudaMemcpy(nodeVisited, &visited, sizeof(int), cudaMemcpyHostToDevice);
+  kernel_total_time_ms = 0.0f;
+
+  // main loop
+  while (numCurrLevelNodes > 0) {
+    // start a cuda timer
+    cudaEventRecord(start);
+
+    gpu_block_queuing_kernel<<<NUM_BLOCKS, BLOCK_SIZE,
+                               sizeof(int) * (BQ_CAPACITY + 1)>>>(
+        graph->nodePtrs, graph->nodeNeighbors, nodeVisited, currLevelNodes,
+        nextLevelNodes, numCurrLevelNodes, numNextLevelNodes);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0.0f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    kernel_total_time_ms += milliseconds;
+
+    // copy numNextLevelNodes to numCurrLevelNodes
+    cudaMemcpy(&numCurrLevelNodes, numNextLevelNodes, sizeof(int),
+               cudaMemcpyDeviceToHost);
+    // reset numNextLevelNodes
+    cudaMemset(numNextLevelNodes, 0, sizeof(int));
+
+    // swap currLevelNodes and nextLevelNodes
+    int *tmp = currLevelNodes;
+    currLevelNodes = nextLevelNodes;
+    nextLevelNodes = tmp;
+  }
+
+  // print number of visited nodes
+  cudaMallocHost(&nodeVisitedHost, sizeof(int) * graph->numNodes);
+  cudaMemcpy(nodeVisitedHost, nodeVisited, sizeof(int) * graph->numNodes,
+             cudaMemcpyDeviceToHost);
+  numVisitedNodes = 0;
+  for (int i = 0; i < graph->numNodes; i++) {
+    if (nodeVisitedHost[i] == 1) {
+      numVisitedNodes++;
+    }
+  }
+  printf("Number of visited nodes: %d\n", numVisitedNodes);
+
+  // print kernel total time
+  printf("Block queuing kernel total time: %f ms\n", kernel_total_time_ms);
 
   return 0;
 }
