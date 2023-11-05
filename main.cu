@@ -3,8 +3,7 @@
 
 #define BLOCK_SIZE 512
 #define NUM_BLOCKS 128
-// Maximum number of elements that can be inserted into a block queue
-#define BQ_CAPACITY 2048
+#define BLOCK_QUEUE_CAP 2048
 
 // Graph structure
 typedef struct {
@@ -61,7 +60,7 @@ Graph *loadGraphUndirected(const char *filename, bool mtx) {
       mySet.insert({src, dest});
     }
   } else {
-    while (fscanf(file, "%d %d", &src, &dest) != EOF) {
+    while (fscanf(file, "%d %d", &dest, &src) != EOF) {
       mySet.insert({src - 1, dest - 1});
     }
   }
@@ -96,7 +95,6 @@ Graph *loadGraphUndirected(const char *filename, bool mtx) {
   // fill nodePtrs and nodeNeighbors arrays
   int currNode = 0;
   int currEdge = 0;
-  nodePtrsHost[0] = 0;
   for (auto it = mySet.begin(); it != mySet.end(); it++) {
     if (it->src == currNode) {
       nodeNeighborsHost[currEdge] = it->dest;
@@ -113,7 +111,7 @@ Graph *loadGraphUndirected(const char *filename, bool mtx) {
   mySet.clear();
 
   // copy nodePtrs and nodeNeighbors arrays to device
-  cudaMemcpy(graph->nodePtrs, nodePtrsHost, sizeof(int) * (graph->numNodes + 1),
+  cudaMemcpy(graph->nodePtrs, nodePtrsHost, sizeof(int) * (graph->numNodes),
              cudaMemcpyHostToDevice);
   cudaMemcpy(graph->nodeNeighbors, nodeNeighborsHost, sizeof(int) * numEdges,
              cudaMemcpyHostToDevice);
@@ -162,8 +160,9 @@ __global__ void gpu_block_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
 
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   int stride = blockDim.x * gridDim.x;
-  extern __shared__ int shared_mem[]; // shared_queue[0] is the size of the
-  // queue, the rest is the queue itself
+
+  // shared_queue[0] is the size of the queue
+  __shared__ int shared_mem[BLOCK_QUEUE_CAP + 1];
 
   int *shared_queue_size = &shared_mem[0];
   int *shared_queue = &shared_mem[1];
@@ -185,9 +184,10 @@ __global__ void gpu_block_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
       int neighbor = nodeNeighbors[j];
       // If the neighbor has not been visited yet.
       if (atomicCAS(&nodeVisited[neighbor], 0, 1) == 0) {
+        int index =
+            atomicAdd_block(shared_queue_size, 1); // avaiable since arch=sm_70
         // if there is space in the shared queue
-        int index = atomicAdd_block(shared_queue_size, 1);
-        if (index < BQ_CAPACITY) {
+        if (index < BLOCK_QUEUE_CAP) {
           // add the neighbor to the shared queue
           shared_queue[index] = neighbor;
         } else {
@@ -198,17 +198,21 @@ __global__ void gpu_block_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
       }
     }
   }
-
-  // copy the shared queue to the global queue
   __syncthreads();
 
-  if (*shared_queue_size > BQ_CAPACITY)
-    *shared_queue_size = BQ_CAPACITY;
+  // copy the shared queue to the global queue
+  if (*shared_queue_size > BLOCK_QUEUE_CAP)
+    *shared_queue_size = BLOCK_QUEUE_CAP;
 
+  __shared__ int global_queue_index;
   if (threadIdx.x == 0) {
-    for (int i = 0; i < *shared_queue_size; i++) {
-      nextLevelNodes[atomicAdd(numNextLevelNodes, 1)] = shared_queue[i];
-    }
+    global_queue_index = atomicAdd(numNextLevelNodes, *shared_queue_size);
+  }
+
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < *shared_queue_size; i += blockDim.x) {
+    nextLevelNodes[global_queue_index + i] = shared_queue[i];
   }
 }
 
@@ -229,8 +233,6 @@ int main(int argc, char **argv) {
 
   Graph *graph = loadGraphUndirected(filename, mtx);
 
-  // initialize nodeVisited, currLevelNodes, nextLevelNodes,
-  // numCurrLevelNodes, numNextLevelNodes
   int *nodeVisited;
   int *currLevelNodes;
   int *nextLevelNodes;
@@ -256,7 +258,7 @@ int main(int argc, char **argv) {
   cudaMemcpy(nodeVisited, &visited, sizeof(int), cudaMemcpyHostToDevice);
   float kernel_total_time_ms = 0.0f;
 
-  // main loop
+  // main loop (global queuing)
   while (numCurrLevelNodes > 0) {
     // start a cuda timer
     cudaEventRecord(start);
@@ -310,13 +312,12 @@ int main(int argc, char **argv) {
   cudaMemcpy(nodeVisited, &visited, sizeof(int), cudaMemcpyHostToDevice);
   kernel_total_time_ms = 0.0f;
 
-  // main loop
+  // main loop (block queuing)
   while (numCurrLevelNodes > 0) {
     // start a cuda timer
     cudaEventRecord(start);
 
-    gpu_block_queuing_kernel<<<NUM_BLOCKS, BLOCK_SIZE,
-                               sizeof(int) * (BQ_CAPACITY + 1)>>>(
+    gpu_block_queuing_kernel<<<NUM_BLOCKS, BLOCK_SIZE>>>(
         graph->nodePtrs, graph->nodeNeighbors, nodeVisited, currLevelNodes,
         nextLevelNodes, numCurrLevelNodes, numNextLevelNodes);
 
