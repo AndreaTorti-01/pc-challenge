@@ -9,7 +9,7 @@
             "type": "cuda-gdb",
             "request": "launch",
             "program": "${workspaceFolder}/main",
-            "args": "roadNet-CA.mtx",
+            "args": "roadNet-CA.mtx 128 128",
             "cwd": "${workspaceFolder}"
         },
         {

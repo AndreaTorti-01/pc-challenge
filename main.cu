@@ -1,9 +1,7 @@
 #include <cstdio>
 #include <set>
 
-#define BLOCK_SIZE 512
-#define NUM_BLOCKS 128
-#define BLOCK_QUEUE_CAP 2048
+#define BLOCK_QUEUE_CAP 4096
 
 // Graph structure
 typedef struct {
@@ -217,12 +215,14 @@ __global__ void gpu_block_queuing_kernel(int *nodePtrs, int *nodeNeighbors,
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: %s <graph file>\n", argv[0]);
+  if (argc < 4) {
+    printf("Usage: %s <graph file> <num blocks> <block size>\n", argv[0]);
     return 1;
   }
 
   const char *filename = argv[1];
+  const int NUM_BLOCKS = atoi(argv[2]);
+  const int BLOCK_SIZE = atoi(argv[3]);
 
   bool mtx = false;
   // if filename ends with .mtx, then it's a Matrix Market file
