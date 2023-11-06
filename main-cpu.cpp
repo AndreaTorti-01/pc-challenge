@@ -57,18 +57,12 @@ Graph *loadGraphUndirected(const char *filename, bool mtx) {
   if (!mtx) {
     while (fscanf(file, "%d %d", &src, &dest) != EOF) {
       mySet.insert({src, dest});
+      mySet.insert({dest, src}); // add the reverse edge
     }
   } else {
     while (fscanf(file, "%d %d", &dest, &src) != EOF) {
       mySet.insert({src - 1, dest - 1});
-    }
-  }
-
-  // for every node {a, b}, check if {b, a} is in the set, if not, add it
-  for (auto it = mySet.begin(); it != mySet.end(); it++) {
-    TwoInts tmp = {it->dest, it->src};
-    if (mySet.find(tmp) == mySet.end()) {
-      mySet.insert(tmp);
+      mySet.insert({dest - 1, src - 1}); // add the reverse edge
     }
   }
 
@@ -92,10 +86,12 @@ Graph *loadGraphUndirected(const char *filename, bool mtx) {
       nodeNeighborsHost[currEdge] = it->dest;
       currEdge++;
     } else {
-      currNode++;
-      nodePtrsHost[currNode] = currEdge;
+      for (int i = currNode + 1; i <= it->src; i++) {
+        nodePtrsHost[i] = currEdge;
+      }
       nodeNeighborsHost[currEdge] = it->dest;
       currEdge++;
+      currNode = it->src; // update currNode to the current source node
     }
   }
 
