@@ -247,6 +247,11 @@ int main(int argc, char **argv) {
   cudaMalloc(&nextLevelNodes, sizeof(int) * graph->numNodes);
   cudaMalloc(&numNextLevelNodes, sizeof(int));
 
+  gpu_global_queuing_kernel<<<NUM_BLOCKS, BLOCK_SIZE>>>(
+      graph->nodePtrs, graph->nodeNeighbors, nodeVisited, currLevelNodes,
+      nextLevelNodes, numCurrLevelNodes,
+      numNextLevelNodes); // empty call to have consistent timing
+
   // reset
   cudaMemset(nodeVisited, 0, sizeof(int) * graph->numNodes);
   cudaMemset(currLevelNodes, 0, sizeof(int) * graph->numNodes);
